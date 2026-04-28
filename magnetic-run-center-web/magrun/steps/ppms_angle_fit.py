@@ -35,6 +35,76 @@ def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return 1.0 - ss_res / ss_tot
 
 
+def _pick_last_sweep_by_reset(
+    ang: np.ndarray,
+    mag: np.ndarray,
+    sig: np.ndarray,
+    *,
+    zero_window_deg: float = 5.0,
+    leave_zero_deg: float = 15.0,
+    min_points_between_resets: int = 20,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Pick the last angular sweep within a segment.
+
+    A "reset" is detected when angle returns to near 0 (within zero_window_deg)
+    after having left the zero region (abs(angle) >= leave_zero_deg). This works
+    for both 0→360 and 0→-360 style scans.
+    """
+    n = int(ang.size)
+    if n == 0:
+        return ang, mag, sig
+
+    # Track sweep starts by reset events.
+    starts: list[int] = [0]
+    in_zero = bool(abs(float(ang[0])) <= zero_window_deg)
+    has_left_zero = bool(abs(float(ang[0])) >= leave_zero_deg)
+    last_reset_i = 0
+
+    for i in range(1, n):
+        a = float(ang[i])
+        a_abs = abs(a)
+        now_in_zero = a_abs <= zero_window_deg
+        if a_abs >= leave_zero_deg:
+            has_left_zero = True
+
+        # Transition non-zero -> zero after leaving zero: treat as reset
+        if (not in_zero) and now_in_zero and has_left_zero and (i - last_reset_i) >= min_points_between_resets:
+            starts.append(i)
+            last_reset_i = i
+            has_left_zero = False
+
+        in_zero = now_in_zero
+
+    if len(starts) <= 1:
+        return ang, mag, sig
+
+    s = starts[-1]
+    return ang[s:], mag[s:], sig[s:]
+
+
+def _dedupe_angle_keep_last(
+    ang: np.ndarray, mag: np.ndarray, sig: np.ndarray, *, angle_tol_deg: float = 0.1
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Dedupe repeated angles by binning with a tolerance, keeping the last occurrence.
+    """
+    if ang.size == 0:
+        return ang, mag, sig
+
+    last: dict[float, tuple[int, float, float, float]] = {}
+    for i in range(int(ang.size)):
+        a = float(ang[i])
+        key = round(a / angle_tol_deg) * angle_tol_deg
+        last[key] = (i, a, float(mag[i]), float(sig[i]))
+
+    items = sorted(last.values(), key=lambda t: t[0])
+    ang2 = np.asarray([t[1] for t in items], dtype=float)
+    mag2 = np.asarray([t[2] for t in items], dtype=float)
+    sig2 = np.asarray([t[3] for t in items], dtype=float)
+    return ang2, mag2, sig2
+
+
 def _to_excel_bytes(df: pd.DataFrame) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
@@ -116,7 +186,7 @@ class PpmsAngleFitStep:
         description=(
             "兼容两类表头（Mag Field/Angle/Lock-in 或 Magnet(Oe)/Position(Deg)1/X(V)_SR-830）。\n\n"
             "- 按磁场跳变切段（同一文件可含多段不同磁场的角度扫）\n"
-            "- 角度模式：0→360 单调递增\n"
+            "- 角度模式：支持 0→360 或 0→-360；若同一磁场下多次扫角（回到 0 附近重置），只保留最后一圈\n"
             "- 覆盖不足/点数不足：废弃该段（RejectReason）\n"
             "- 对有效段做七参数拟合并输出 A..G, R2\n"
         ),
@@ -215,6 +285,13 @@ class PpmsAngleFitStep:
                 seg_mag, seg_ang, seg_sig_v = seg_mag[good], seg_ang[good], seg_sig_v[good]
                 if seg_mag.size == 0:
                     continue
+
+                # If the user scanned multiple angular sweeps at the same field
+                # (resetting angle back to ~0), keep only the LAST sweep.
+                seg_ang, seg_mag, seg_sig_v = _pick_last_sweep_by_reset(seg_ang, seg_mag, seg_sig_v)
+                # Within the last sweep, if the same angle appears multiple times,
+                # keep the last occurrence (robust to small floating drift).
+                seg_ang, seg_mag, seg_sig_v = _dedupe_angle_keep_last(seg_ang, seg_mag, seg_sig_v)
 
                 mag_rep = float(np.median(seg_mag))
                 ang_min = float(np.min(seg_ang))
