@@ -37,11 +37,16 @@ if not by_cat:
     st.stop()
 
 cats = list(by_cat.keys())
-cat = st.selectbox("📌 选择任务类别", cats)
-steps = by_cat[cat]
-step_names = [s.step.meta.name for s in steps]
-sel_name = st.selectbox("📋 选择具体功能", step_names)
-sel = next(x for x in steps if x.step.meta.name == sel_name).step
+with st.sidebar:
+    st.markdown("### 🧭 任务选择")
+    cat = st.selectbox("📌 任务类别", cats)
+    steps = by_cat[cat]
+    step_names = [s.step.meta.name for s in steps]
+    sel_name = st.selectbox("📋 具体功能", step_names)
+    sel = next(x for x in steps if x.step.meta.name == sel_name).step
+
+    st.markdown("---")
+    st.caption("提示：任务选择放在侧边栏，主页面用于查看说明与结果。")
 
 with st.expander("📖 功能说明", expanded=True):
     st.markdown(sel.meta.description)
@@ -108,5 +113,5 @@ if st.button("▶️ 开始处理", use_container_width=True, type="primary"):
             )
 
 st.markdown("---")
-st.caption("magnetic-run-center-web | 插件化 steps + Streamlit RunCenter")
+st.caption("magnetic-run-center-web | 插件化 steps + Streamlit RunCenter | 设计：王赛赛")
 
