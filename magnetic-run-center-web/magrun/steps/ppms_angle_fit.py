@@ -36,6 +36,21 @@ def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return 1.0 - ss_res / ss_tot
 
 
+def _robust_sigma_mad(x: np.ndarray) -> float:
+    """
+    Robust scale estimate using MAD (median absolute deviation).
+    Returns an estimate of sigma assuming normality, or NaN if undefined.
+    """
+    x = np.asarray(x, dtype=float)
+    if x.size == 0:
+        return float("nan")
+    med = float(np.median(x))
+    mad = float(np.median(np.abs(x - med)))
+    if (not np.isfinite(mad)) or mad == 0.0:
+        return float("nan")
+    return 1.4826 * mad
+
+
 def _spike_filter_by_residual_mad(
     x_deg: np.ndarray,
     y: np.ndarray,
@@ -63,6 +78,39 @@ def _spike_filter_by_residual_mad(
 
     sigma = 1.4826 * mad  # MAD -> std scale (normal assumption)
     keep = np.abs(resid_centered) <= (k * sigma)
+    removed = int((~keep).sum())
+    return keep, removed
+
+
+def _spike_filter_by_diff2_mad(
+    y: np.ndarray,
+    *,
+    k: float = 6.0,
+) -> tuple[np.ndarray, int]:
+    """
+    Drop local spike points using second-difference (curvature) outlier detection.
+
+    For monotonic angular scans, lock-in noise spikes often show up as a single
+    point with abnormally large second difference:
+        d2[i] = y[i+1] - 2*y[i] + y[i-1]
+    We flag i where |d2[i]| > k * sigma_d2 (sigma from MAD) and drop point i.
+    """
+    y = np.asarray(y, dtype=float)
+    n = int(y.size)
+    keep = np.ones(n, dtype=bool)
+    if n < 3:
+        return keep, 0
+
+    d2 = y[2:] - 2.0 * y[1:-1] + y[:-2]
+    sigma = _robust_sigma_mad(d2)
+    if not np.isfinite(sigma):
+        return keep, 0
+
+    bad_mid = np.abs(d2 - float(np.median(d2))) > (k * sigma)
+    # bad_mid corresponds to indices 1..n-2 in the original y
+    if np.any(bad_mid):
+        mid_idx = np.nonzero(bad_mid)[0] + 1
+        keep[mid_idx] = False
     removed = int((~keep).sum())
     return keep, removed
 
@@ -209,6 +257,7 @@ class _Cfg:
     sort_angle: bool
     generate_plot: bool
     remove_spikes: bool
+    spike_method: str
     spike_k: float
     min_points_after_spike_filter: int
 
@@ -252,7 +301,19 @@ class PpmsAngleFitStep:
                 label="跳点/尖峰剔除（残差MAD）",
                 kind="bool",
                 default=True,
-                help="先拟合一次，再按残差MAD剔除离群点，最后再拟合一次。",
+                help="将尝试剔除锁相噪声引入的跳点/尖峰（可在下方选择方法）。",
+            ),
+            StepParam(
+                key="spike_method",
+                label="跳点剔除方法",
+                kind="select",
+                default="二阶差分 + 残差MAD（推荐）",
+                options=[
+                    "二阶差分 + 残差MAD（推荐）",
+                    "仅二阶差分（适合单点尖峰）",
+                    "仅残差MAD（适合全局离群点）",
+                ],
+                help="单调扫角（0→-360）时建议用二阶差分；若仍有离群点，再叠加残差MAD。",
             ),
             StepParam(
                 key="spike_k",
@@ -272,6 +333,19 @@ class PpmsAngleFitStep:
     )
 
     def run(self, *, files: list[tuple[str, bytes]], params: Mapping[str, Any]) -> StepOutputs:
+        spike_method_raw = str(params.get("spike_method", "二阶差分 + 残差MAD（推荐）"))
+        spike_method_map = {
+            # Chinese UI labels
+            "二阶差分 + 残差MAD（推荐）": "diff2_then_residual",
+            "仅二阶差分（适合单点尖峰）": "diff2_mad",
+            "仅残差MAD（适合全局离群点）": "residual_mad",
+            # Backward-compatible English values
+            "diff2_then_residual": "diff2_then_residual",
+            "diff2_mad": "diff2_mad",
+            "residual_mad": "residual_mad",
+        }
+        spike_method = spike_method_map.get(spike_method_raw, "diff2_then_residual")
+
         cfg = _Cfg(
             lockin_channel=str(params.get("lockin_channel", "X(V)_SR-830")),
             lockin_unit=str(params.get("lockin_unit", "uV")),
@@ -281,6 +355,7 @@ class PpmsAngleFitStep:
             sort_angle=bool(params.get("sort_angle", True)),
             generate_plot=bool(params.get("generate_plot", True)),
             remove_spikes=bool(params.get("remove_spikes", True)),
+            spike_method=spike_method,
             spike_k=float(params.get("spike_k", 6.0)),
             min_points_after_spike_filter=int(params.get("min_points_after_spike_filter", 7)),
         )
@@ -400,32 +475,30 @@ class PpmsAngleFitStep:
                     try:
                         # Initial parameter guess: A starts from 0 (user preference).
                         initial = [0.0, 0, 0, 0, 0, 0, 0]
-                        popt_arr, _ = curve_fit(
-                            _fit_func_deg,
-                            seg_ang,
-                            seg_sig_used,
-                            p0=initial,
-                            maxfev=10000,
-                        )
-
-                        if cfg.remove_spikes:
-                            keep_mask, removed = _spike_filter_by_residual_mad(
-                                seg_ang, seg_sig_used, popt_arr, k=cfg.spike_k
-                            )
-                            npts_after_spike_filter = int(np.sum(keep_mask))
-                            spike_removed_count = int(removed)
-
-                            if npts_after_spike_filter >= cfg.min_points_after_spike_filter:
+                        # Spike filtering: for monotonic scans, diff2-based filtering is
+                        # often better at removing lock-in noise spikes than global residual filtering.
+                        if cfg.remove_spikes and cfg.spike_method in ("diff2_mad", "diff2_then_residual"):
+                            keep_mask, removed = _spike_filter_by_diff2_mad(seg_sig_used, k=cfg.spike_k)
+                            spike_removed_count += int(removed)
+                            if int(np.sum(keep_mask)) >= cfg.min_points_after_spike_filter:
                                 seg_ang = seg_ang[keep_mask]
                                 seg_sig_used = seg_sig_used[keep_mask]
-                                popt_arr2, _ = curve_fit(
-                                    _fit_func_deg,
-                                    seg_ang,
-                                    seg_sig_used,
-                                    p0=popt_arr,
-                                    maxfev=10000,
-                                )
-                                popt_arr = popt_arr2
+                            else:
+                                valid = False
+                                reject = "spike_filter_too_few_points_after_filter"
+
+                        if not valid:
+                            raise RuntimeError(reject)
+
+                        popt_arr, _ = curve_fit(_fit_func_deg, seg_ang, seg_sig_used, p0=initial, maxfev=10000)
+
+                        if cfg.remove_spikes and cfg.spike_method in ("residual_mad", "diff2_then_residual"):
+                            keep_mask, removed = _spike_filter_by_residual_mad(seg_ang, seg_sig_used, popt_arr, k=cfg.spike_k)
+                            spike_removed_count += int(removed)
+                            if int(np.sum(keep_mask)) >= cfg.min_points_after_spike_filter:
+                                seg_ang = seg_ang[keep_mask]
+                                seg_sig_used = seg_sig_used[keep_mask]
+                                popt_arr, _ = curve_fit(_fit_func_deg, seg_ang, seg_sig_used, p0=popt_arr, maxfev=10000)
                             else:
                                 valid = False
                                 reject = "spike_filter_too_few_points_after_filter"
@@ -436,6 +509,9 @@ class PpmsAngleFitStep:
                     except Exception:
                         valid = False
                         reject = "curve_fit_failed"
+                    finally:
+                        # Update post-filter point count for reporting.
+                        npts_after_spike_filter = int(seg_ang.size)
 
                 all_rows.append(
                     {
