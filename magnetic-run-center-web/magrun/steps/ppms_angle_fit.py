@@ -35,6 +35,37 @@ def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return 1.0 - ss_res / ss_tot
 
 
+def _spike_filter_by_residual_mad(
+    x_deg: np.ndarray,
+    y: np.ndarray,
+    popt_arr: np.ndarray,
+    *,
+    k: float = 6.0,
+) -> tuple[np.ndarray, int]:
+    """
+    Robustly drop "spike" points based on residual magnitude.
+
+    Uses MAD of residuals with a configurable cutoff k*sigma.
+    """
+    y_pred = _fit_func_deg(x_deg, *popt_arr)
+    resid = y - y_pred
+
+    # Median-centered residuals for robustness against skew.
+    resid_med = float(np.median(resid))
+    resid_centered = resid - resid_med
+    mad = float(np.median(np.abs(resid_centered)))
+
+    if (not np.isfinite(mad)) or mad == 0.0:
+        keep = np.ones_like(resid_centered, dtype=bool)
+        removed = int((~keep).sum())
+        return keep, removed
+
+    sigma = 1.4826 * mad  # MAD -> std scale (normal assumption)
+    keep = np.abs(resid_centered) <= (k * sigma)
+    removed = int((~keep).sum())
+    return keep, removed
+
+
 def _pick_last_sweep_by_reset(
     ang: np.ndarray,
     mag: np.ndarray,
@@ -176,6 +207,9 @@ class _Cfg:
     min_points_per_segment: int
     sort_angle: bool
     generate_plot: bool
+    remove_spikes: bool
+    spike_k: float
+    min_points_after_spike_filter: int
 
 
 class PpmsAngleFitStep:
@@ -212,6 +246,27 @@ class PpmsAngleFitStep:
             StepParam(key="min_points_per_segment", label="每段最少点数", kind="int", default=30),
             StepParam(key="sort_angle", label="按角度排序", kind="bool", default=True),
             StepParam(key="generate_plot", label="生成合并图（PNG）", kind="bool", default=True),
+            StepParam(
+                key="remove_spikes",
+                label="跳点/尖峰剔除（残差MAD）",
+                kind="bool",
+                default=True,
+                help="先拟合一次，再按残差MAD剔除离群点，最后再拟合一次。",
+            ),
+            StepParam(
+                key="spike_k",
+                label="剔除阈值系数(k)",
+                kind="float",
+                default=6.0,
+                help="越小越严格；建议从6附近开始调。",
+            ),
+            StepParam(
+                key="min_points_after_spike_filter",
+                label="剔除后最少点数",
+                kind="int",
+                default=7,
+                help="剔除后点数不足将拒绝该段。",
+            ),
         ],
     )
 
@@ -224,6 +279,9 @@ class PpmsAngleFitStep:
             min_points_per_segment=int(params.get("min_points_per_segment", 30)),
             sort_angle=bool(params.get("sort_angle", True)),
             generate_plot=bool(params.get("generate_plot", True)),
+            remove_spikes=bool(params.get("remove_spikes", True)),
+            spike_k=float(params.get("spike_k", 6.0)),
+            min_points_after_spike_filter=int(params.get("min_points_after_spike_filter", 7)),
         )
 
         out = StepOutputs()
@@ -298,6 +356,8 @@ class PpmsAngleFitStep:
                 ang_max = float(np.max(seg_ang))
                 coverage = ang_max - ang_min
                 npts = int(seg_ang.size)
+                npts_after_spike_filter = npts
+                spike_removed_count = 0
 
                 valid = True
                 reject = ""
@@ -325,7 +385,36 @@ class PpmsAngleFitStep:
                 if valid and npts >= 7:
                     try:
                         initial = [-90.0, 0, 0, 0, 0, 0, 0]
-                        popt_arr, _ = curve_fit(_fit_func_deg, seg_ang, seg_sig_used, p0=initial, maxfev=10000)
+                        popt_arr, _ = curve_fit(
+                            _fit_func_deg,
+                            seg_ang,
+                            seg_sig_used,
+                            p0=initial,
+                            maxfev=10000,
+                        )
+
+                        if cfg.remove_spikes:
+                            keep_mask, removed = _spike_filter_by_residual_mad(
+                                seg_ang, seg_sig_used, popt_arr, k=cfg.spike_k
+                            )
+                            npts_after_spike_filter = int(np.sum(keep_mask))
+                            spike_removed_count = int(removed)
+
+                            if npts_after_spike_filter >= cfg.min_points_after_spike_filter:
+                                seg_ang = seg_ang[keep_mask]
+                                seg_sig_used = seg_sig_used[keep_mask]
+                                popt_arr2, _ = curve_fit(
+                                    _fit_func_deg,
+                                    seg_ang,
+                                    seg_sig_used,
+                                    p0=popt_arr,
+                                    maxfev=10000,
+                                )
+                                popt_arr = popt_arr2
+                            else:
+                                valid = False
+                                reject = "spike_filter_too_few_points_after_filter"
+
                         popt = [float(x) for x in popt_arr.tolist()]
                         y_pred = _fit_func_deg(seg_ang, *popt_arr)
                         r2 = _r2(seg_sig_used, y_pred)
@@ -354,6 +443,8 @@ class PpmsAngleFitStep:
                         "F": popt[5],
                         "G": popt[6],
                         "R2": r2,
+                        "N_points_after_spike_filter": npts_after_spike_filter,
+                        "SpikeRemovedCount": spike_removed_count,
                     }
                 )
 
