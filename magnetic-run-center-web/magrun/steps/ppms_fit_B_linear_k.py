@@ -31,6 +31,19 @@ def _extract_current_ma(filename: str) -> float:
         return float("nan")
 
 
+def _extract_du(filename: str) -> float:
+    """
+    Extract DU angle from filename, e.g. '...-30DU-...' -> -30.
+    """
+    m = re.search(r"(-?\\d+\\.?\\d*)\\s*DU", filename, flags=re.IGNORECASE)
+    if not m:
+        return float("nan")
+    try:
+        return float(m.group(1))
+    except Exception:
+        return float("nan")
+
+
 def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -63,6 +76,7 @@ def _fit_linear_through_origin(x: np.ndarray, y: np.ndarray) -> tuple[float, flo
 @dataclass(frozen=True)
 class _Cfg:
     fit_mode: str
+    group_by: str
     min_points_per_current: int
     filter_valid_only: bool
     generate_plots: bool
@@ -71,17 +85,25 @@ class _Cfg:
 class PpmsFitBLinearKStep:
     meta = StepMeta(
         id="ppms_fit_B_linear_k",
-        name="对拟合后的 B 列线性拟合（按电流求 K）",
+        name="对拟合后的 B 列线性拟合（按角度DU求 K）",
         category="🧪 PPMS 数据处理",
         description=(
             "读取上一步 `PPMS 角度扫描拟合（多段磁场）` 导出的 Excel（含 `PPMS Fit Results` 表）。\n\n"
-            "对每个电流（从 `File` 字段的文件名中提取 `xxmA`）分别做线性拟合：\n"
+            "对每个角度/方位（从 `File` 字段的文件名中提取 `xxDU`）分别做线性拟合：\n"
             "- x 轴：七参数拟合后的 B\n"
             "- y 轴：1 / (Mag_Oe/1000 + 1)\n"
-            "每个电流得到一个 K（斜率），并生成对应散点+拟合线图片，便于检查。"
+            "每个 DU 得到一个 K（斜率），并生成对应散点+拟合线图片，便于检查。\n\n"
+            "如果你的文件名也包含 `xxmA`，也可切换为按电流分组。"
         ),
         file_types=["xlsx"],
         params=[
+            StepParam(
+                key="group_by",
+                label="分组字段（从 File 文件名提取）",
+                kind="select",
+                default="角度DU（xxDU）",
+                options=["角度DU（xxDU）", "电流mA（xxmA）"],
+            ),
             StepParam(
                 key="fit_mode",
                 label="线性拟合方式",
@@ -89,7 +111,7 @@ class PpmsFitBLinearKStep:
                 default="带截距：y = kx + b",
                 options=["带截距：y = kx + b", "过原点：y = kx"],
             ),
-            StepParam(key="min_points_per_current", label="每个电流最少点数", kind="int", default=3),
+            StepParam(key="min_points_per_current", label="每组最少点数", kind="int", default=3),
             StepParam(
                 key="filter_valid_only",
                 label="仅使用 Valid=True 的点（若存在该列）",
@@ -103,6 +125,7 @@ class PpmsFitBLinearKStep:
     def run(self, *, files: list[tuple[str, bytes]], params: Mapping[str, Any]) -> StepOutputs:
         cfg = _Cfg(
             fit_mode=str(params.get("fit_mode", "带截距：y = kx + b")),
+            group_by=str(params.get("group_by", "角度DU（xxDU）")),
             min_points_per_current=int(params.get("min_points_per_current", 3)),
             filter_valid_only=bool(params.get("filter_valid_only", True)),
             generate_plots=bool(params.get("generate_plots", True)),
@@ -150,11 +173,16 @@ class PpmsFitBLinearKStep:
         if cfg.filter_valid_only and "Valid" in data.columns:
             data = data[data["Valid"] == True].copy()  # noqa: E712
 
-        # Extract current from filename
-        data["current_mA"] = data["File"].astype(str).map(_extract_current_ma)
-        data = data[np.isfinite(data["current_mA"])].copy()
+        group_is_du = "DU" in cfg.group_by.upper()
+        group_col = "DU" if group_is_du else "current_mA"
+        extractor = _extract_du if group_is_du else _extract_current_ma
+        data[group_col] = data["File"].astype(str).map(extractor)
+        data = data[np.isfinite(data[group_col])].copy()
         if len(data) == 0:
-            out.notes.append("未从 `File` 字段提取到电流（xxmA）。请确认文件名包含例如 `15mA`。")
+            if group_is_du:
+                out.notes.append("未从 `File` 字段提取到角度（xxDU）。请确认文件名包含例如 `-30DU` 或 `0DU`。")
+            else:
+                out.notes.append("未从 `File` 字段提取到电流（xxmA）。请确认文件名包含例如 `15mA`。")
             return out
 
         # Build x/y
@@ -170,7 +198,7 @@ class PpmsFitBLinearKStep:
 
         fit_through_origin = "过原点" in cfg.fit_mode
 
-        for current, g in data.groupby("current_mA", sort=True):
+        for group_value, g in data.groupby(group_col, sort=True):
             x = g["x_B"].to_numpy(dtype=float)
             y = g["y_inv"].to_numpy(dtype=float)
             n = int(x.size)
@@ -198,11 +226,12 @@ class PpmsFitBLinearKStep:
 
             rows_out.append(
                 {
-                    "current_mA": float(current),
+                    group_col: float(group_value),
                     "N_points": n,
                     "k": float(k),
                     "b": float(b) if not fit_through_origin else 0.0,
                     "R2": float(r2),
+                    "group_by": cfg.group_by,
                     "fit_mode": cfg.fit_mode,
                     "status": status,
                     "reason": reason,
@@ -218,7 +247,8 @@ class PpmsFitBLinearKStep:
 
                 ax.set_xlabel("B (from 7-parameter fit)")
                 ax.set_ylabel("1 / (Mag_Oe/1000 + 1)")
-                ax.set_title(f"{float(current):g} mA | k={k:.6g} | R2={r2:.3f} | N={n}")
+                unit = "DU" if group_is_du else "mA"
+                ax.set_title(f"{float(group_value):g} {unit} | k={k:.6g} | R2={r2:.3f} | N={n}")
                 ax.grid(True, ls="--", alpha=0.3)
                 fig.tight_layout()
 
@@ -227,14 +257,15 @@ class PpmsFitBLinearKStep:
                 plt.close(fig)
                 buf.seek(0)
 
-                img_name = f"{output_base}_Kfit_{float(current):g}mA.png"
-                out.images[f"{float(current):g} mA"] = (img_name, buf.getvalue(), "image/png")
+                unit = "DU" if group_is_du else "mA"
+                img_name = f"{output_base}_Kfit_{float(group_value):g}{unit}.png"
+                out.images[f"{float(group_value):g} {unit}"] = (img_name, buf.getvalue(), "image/png")
 
-        res_df = pd.DataFrame(rows_out).sort_values("current_mA").reset_index(drop=True)
+        res_df = pd.DataFrame(rows_out).sort_values(group_col).reset_index(drop=True)
         out.tables["K results"] = res_df
         # Point-level details (for downstream processing / auditing)
         details_cols = [
-            "current_mA",
+            group_col,
             "File",
             "SegmentID",
             "Mag_Oe",
@@ -245,7 +276,7 @@ class PpmsFitBLinearKStep:
         ]
         details_present = [c for c in details_cols if c in data.columns]
         details_df = data[details_present].copy()
-        out.tables["Point details (B vs y)"] = details_df.sort_values(["current_mA"]).reset_index(drop=True)
+        out.tables["Point details (B vs y)"] = details_df.sort_values([group_col]).reset_index(drop=True)
         out.downloads["Excel"] = (
             f"{output_base}_B_linear_fit_K.xlsx",
             _to_excel_bytes(res_df),
