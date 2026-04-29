@@ -108,6 +108,7 @@ def _fit_linear_through_origin(x: np.ndarray, y: np.ndarray) -> tuple[float, flo
 class _Cfg:
     fit_mode: str
     group_by: str
+    hk_offset: float
     min_points_per_current: int
     filter_valid_only: bool
     generate_plots: bool
@@ -136,6 +137,13 @@ class PpmsFitBLinearKStep:
                 options=["角度DU（xxDU）", "电流mA（xxmA）"],
             ),
             StepParam(
+                key="hk_offset",
+                label="Hk（y = 1/(H/1000 + Hk) 中的 Hk）",
+                kind="float",
+                default=1.0,
+                help="原默认公式为 1/(Mag_Oe/1000 + 1)。此处可调整 +1 的常数项。",
+            ),
+            StepParam(
                 key="fit_mode",
                 label="线性拟合方式",
                 kind="select",
@@ -157,6 +165,7 @@ class PpmsFitBLinearKStep:
         cfg = _Cfg(
             fit_mode=str(params.get("fit_mode", "带截距：y = kx + b")),
             group_by=str(params.get("group_by", "角度DU（xxDU）")),
+            hk_offset=float(params.get("hk_offset", 1.0)),
             min_points_per_current=int(params.get("min_points_per_current", 3)),
             filter_valid_only=bool(params.get("filter_valid_only", True)),
             generate_plots=bool(params.get("generate_plots", True)),
@@ -219,7 +228,7 @@ class PpmsFitBLinearKStep:
         # Build x/y
         data["x_B"] = pd.to_numeric(data["B"], errors="coerce")
         data["H_kOe"] = pd.to_numeric(data["Mag_Oe"], errors="coerce") / 1000.0
-        data["y_inv"] = 1.0 / (data["H_kOe"] + 1.0)
+        data["y_inv"] = 1.0 / (data["H_kOe"] + float(cfg.hk_offset))
         data = data[np.isfinite(data["x_B"]) & np.isfinite(data["y_inv"])].copy()
         if len(data) == 0:
             out.notes.append("No finite rows after computing x/y.")
