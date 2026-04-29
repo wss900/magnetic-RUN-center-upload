@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import math
+import os
 import re
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -288,6 +289,19 @@ class PpmsAngleFitStep:
         all_rows: list[dict[str, Any]] = []
         plot_series: dict[tuple[str, int], tuple[np.ndarray, np.ndarray, list[float], str]] = {}
 
+        # Generate output filenames based on uploaded input names.
+        # - If multiple files share the same name, treat them as one.
+        # - Otherwise join unique stems with '+'.
+        seen_names: set[str] = set()
+        output_stems: list[str] = []
+        for filename, _ in files:
+            if filename in seen_names:
+                continue
+            seen_names.add(filename)
+            stem = os.path.splitext(os.path.basename(filename))[0]
+            output_stems.append(stem)
+        output_base = "+".join(output_stems) if output_stems else "ppms_fit"
+
         for filename, data in files:
             text = data.decode("utf-8", errors="ignore")
             headers, rows = _parse_table(text)
@@ -384,7 +398,8 @@ class PpmsAngleFitStep:
                 r2 = float("nan")
                 if valid and npts >= 7:
                     try:
-                        initial = [-90.0, 0, 0, 0, 0, 0, 0]
+                        # Initial parameter guess: A starts from 0 (user preference).
+                        initial = [0.0, 0, 0, 0, 0, 0, 0]
                         popt_arr, _ = curve_fit(
                             _fit_func_deg,
                             seg_ang,
@@ -457,7 +472,11 @@ class PpmsAngleFitStep:
 
         df = pd.DataFrame(all_rows)
         out.tables["PPMS Fit Results"] = df
-        out.downloads["Excel"] = ("ppms_fit_results.xlsx", _to_excel_bytes(df), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        out.downloads["Excel"] = (
+            f"{output_base}_ppms_fit_results.xlsx",
+            _to_excel_bytes(df),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
         if cfg.generate_plot:
             valid_df = df[df["Valid"] == True].copy()  # noqa: E712
@@ -495,7 +514,7 @@ class PpmsAngleFitStep:
                 fig.savefig(buf, format="png", dpi=150)
                 plt.close(fig)
                 buf.seek(0)
-                out.images["Plot"] = ("ppms_fit_plot.png", buf.getvalue(), "image/png")
+                out.images["Plot"] = (f"{output_base}_ppms_fit_plot.png", buf.getvalue(), "image/png")
             else:
                 out.notes.append("All segments rejected; no plot.")
 
