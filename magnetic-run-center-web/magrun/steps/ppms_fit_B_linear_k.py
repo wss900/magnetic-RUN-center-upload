@@ -22,7 +22,7 @@ def _to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 
 def _extract_current_ma(filename: str) -> float:
-    m = re.search(r"(\\d+\\.?\\d*)mA", filename)
+    m = re.search(r"(\d+\.?\d*)mA", str(filename))
     if not m:
         return float("nan")
     try:
@@ -35,7 +35,38 @@ def _extract_du(filename: str) -> float:
     """
     Extract DU angle from filename, e.g. '...-30DU-...' -> -30.
     """
-    m = re.search(r"(-?\\d+\\.?\\d*)\\s*DU", filename, flags=re.IGNORECASE)
+    s = str(filename).strip()
+    # Normalize common unicode dashes to ASCII '-'
+    s = (
+        s.replace("—", "-")
+        .replace("–", "-")
+        .replace("−", "-")
+        .replace("‑", "-")
+        .replace("﹣", "-")
+        .replace("－", "-")
+    )
+
+    # Prefer explicit negative DU written as "--30DU" (separator + sign).
+    m = re.search(r"--\s*(\d+\.?\d*)\s*DU", s, flags=re.IGNORECASE)
+    if m:
+        try:
+            return -float(m.group(1))
+        except Exception:
+            return float("nan")
+
+    # Then accept "-30DU" only when '-' is clearly a sign:
+    # - start of string, or
+    # - preceded by whitespace/underscore.
+    # This avoids mis-parsing "NMCFB-90DU-..." where the '-' is just a separator.
+    m = re.search(r"(?:(?<=^)|(?<=[\s_]))-(\d+\.?\d*)\s*DU", s, flags=re.IGNORECASE)
+    if m:
+        try:
+            return -float(m.group(1))
+        except Exception:
+            return float("nan")
+
+    # Finally accept positive "0DU"/"30DU" with no sign.
+    m = re.search(r"(\d+\.?\d*)\s*DU", s, flags=re.IGNORECASE)
     if not m:
         return float("nan")
     try:
