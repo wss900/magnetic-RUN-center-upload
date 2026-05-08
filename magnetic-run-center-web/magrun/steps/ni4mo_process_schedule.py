@@ -51,6 +51,25 @@ def _add_minutes(t0: datetime, minutes: float) -> datetime:
     return t0 + timedelta(minutes=float(minutes))
 
 
+def _build_phone_alarm_prompt(
+    *,
+    g1_start: datetime,
+    g2_start: datetime,
+    before_cool: datetime,
+    after_cool: datetime,
+) -> str:
+    """一段可复制给手机 AI 的自然语言口令（含四个时刻说明）。"""
+    lines = [
+        "帮我在手机里增加下面 4 个闹钟。每个闹钟的标签/备注请用括号里的说明，时间用后面的日期时间（到点响铃或强提醒即可）：",
+        "",
+        f"1. 第一次生长（段起始时刻）— {_fmt(g1_start)}",
+        f"2. 第二次生长（段起始时刻）— {_fmt(g2_start)}",
+        f"3. 降温前（末段退火结束）— {_fmt(before_cool)}",
+        f"4. 降温后（降温结束）— {_fmt(after_cool)}",
+    ]
+    return "\n".join(lines)
+
+
 class Ni4MoProcessScheduleStep:
     """
     Ni4Mo 工艺时间轴：从放入时刻起按各阶段时长累加，给出两次生长区间及降温前后时刻。
@@ -66,7 +85,8 @@ class Ni4MoProcessScheduleStep:
             "- **降温前**（末段退火结束）与**降温后**（降温结束）时刻。\n\n"
             "勾选「使用当前时间作为放入时刻」时，以运行瞬间为起点；否则填写日期与 `HH:MM`。\n"
             "各阶段时长未填或非数字时按 **0** 处理（与参数面板中的数字一致）。\n\n"
-            "**文件**：无需上传（`file_types` 为空时 RunCenter 允许直接运行）。"
+            "**文件**：无需上传（`file_types` 为空时 RunCenter 允许直接运行）。\n\n"
+            "运行后会给出**可复制给手机 AI 的闹钟口令**（表格 + 说明区），并可下载 `ni4mo_手机闹钟口令.txt` 便于长按复制。"
         ),
         file_types=[],
         params=[
@@ -171,11 +191,22 @@ class Ni4MoProcessScheduleStep:
             ]
         )
 
+        alarm_prompt = _build_phone_alarm_prompt(
+            g1_start=g1_start,
+            g2_start=g2_start,
+            before_cool=before_cool,
+            after_cool=after_cool,
+        )
+        prompt_bytes = alarm_prompt.encode("utf-8")
+
         out = StepOutputs()
         out.tables["四个关键时间（自放入起累加）"] = df_four
         out.tables["生长阶段区间"] = df_grow_windows
         out.tables["全流程累加明细"] = df_phases
+        out.tables["复制给手机AI（闹钟口令）"] = pd.DataFrame([{"全文": alarm_prompt}])
         out.notes.append(f"放入基准：{_fmt(t0)}（自该时刻起累加各阶段分钟数）。")
+        out.notes.append("【复制】下面整段可发给手机里的 AI，用于添加闹钟：\n\n" + alarm_prompt)
+        out.downloads["手机闹钟口令 txt"] = ("ni4mo_手机闹钟口令.txt", prompt_bytes, "text/plain; charset=utf-8")
         return out
 
 
