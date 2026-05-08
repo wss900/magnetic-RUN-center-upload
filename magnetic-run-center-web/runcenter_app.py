@@ -52,7 +52,12 @@ with st.expander("📖 功能说明", expanded=True):
     st.markdown(sel.meta.description)
     st.markdown(f'<div class="small-muted">Step ID: <code>{sel.meta.id}</code></div>', unsafe_allow_html=True)
 
-uploaded = st.file_uploader("📂 上传文件", type=sel.meta.file_types, accept_multiple_files=True)
+_needs_upload = bool(sel.meta.file_types)
+_uploader_label = "📂 上传文件（本步骤可不选）" if not _needs_upload else "📂 上传文件"
+_uploader_kwargs: dict[str, object] = {"accept_multiple_files": True}
+if _needs_upload:
+    _uploader_kwargs["type"] = sel.meta.file_types
+uploaded = st.file_uploader(_uploader_label, **_uploader_kwargs)
 files: list[tuple[str, bytes]] = []
 if uploaded:
     for f in uploaded:
@@ -78,7 +83,7 @@ for i, p in enumerate(sel.meta.params):
 
 
 if st.button("▶️ 开始处理", use_container_width=True, type="primary"):
-    if not files:
+    if _needs_upload and not files:
         st.error("请先上传至少一个文件。")
         st.stop()
 
