@@ -10,32 +10,33 @@ from ..models import StepMeta, StepOutputs, StepParam
 
 
 def _parse_hhmm(s: str) -> tuple[int, int] | None:
+    """
+    只解析「时:分」或「时.分」，不要日期。
+    支持：10:30、10：30、10.30、10:30:00（秒忽略，仍按分对齐）。
+    """
     s = (s or "").strip()
     if not s:
         return None
-    m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", s)
-    if not m:
-        return None
-    h, mi = int(m.group(1)), int(m.group(2))
+    s = s.replace("：", ":").replace("．", ".").strip()
+    m = re.match(r"^(\d{1,2})[:.](\d{2})$", s)
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+    else:
+        m = re.match(r"^(\d{1,2}):(\d{2}):(\d{2})$", s)
+        if not m:
+            return None
+        h, mi = int(m.group(1)), int(m.group(2))
     if not (0 <= h <= 23 and 0 <= mi <= 59):
         return None
     return h, mi
 
 
-def _parse_date(s: str) -> date | None:
-    s = (s or "").strip()
-    if not s:
-        return None
-    try:
-        return date.fromisoformat(s)
-    except ValueError:
-        return None
-
-
-def _combine_place_datetime(d: date, tstr: str, *, use_now: bool) -> datetime:
+def _baseline_datetime(*, place_time: str, use_now: bool) -> datetime:
+    """放入基准：当前时间，或「今天 + 指定时刻」（不输入日期）。"""
     if use_now:
         return datetime.now().replace(microsecond=0)
-    parsed = _parse_hhmm(tstr)
+    d = date.today()
+    parsed = _parse_hhmm(place_time)
     if parsed is None:
         h, mi = 0, 0
     else:
@@ -83,7 +84,7 @@ class Ni4MoProcessScheduleStep:
             "从**放入时间**起，按顺序累加各阶段时长（分钟），计算：\n\n"
             "- 两次**生长**阶段的起止时刻；\n"
             "- **降温前**（末段退火结束）与**降温后**（降温结束）时刻。\n\n"
-            "勾选「使用当前时间作为放入时刻」时，以运行瞬间为起点；否则填写日期与 `HH:MM`。\n"
+            "勾选「使用当前时间作为放入时刻」时，以运行瞬间为起点；否则**只填时刻、不填日期**，基准日为**运行当天**，例如 `10:30` 或 `10.30`。\n"
             "各阶段时长未填或非数字时按 **0** 处理（与参数面板中的数字一致）。\n\n"
             "**文件**：无需上传（`file_types` 为空时 RunCenter 允许直接运行）。\n\n"
             "运行后会给出**可复制给手机 AI 的闹钟口令**（表格 + 说明区），并可下载 `ni4mo_手机闹钟口令.txt` 便于长按复制。"
@@ -95,20 +96,14 @@ class Ni4MoProcessScheduleStep:
                 label="使用当前时间作为放入时刻",
                 kind="bool",
                 default=True,
-                help="开启后忽略下方「放入时刻」；关闭后使用日期+时刻。",
-            ),
-            StepParam(
-                key="place_date",
-                label="放入日期 (YYYY-MM-DD，空=今天)",
-                kind="str",
-                default="",
+                help="关闭后使用下方「放入时刻」；基准日为今天，无需填日期。",
             ),
             StepParam(
                 key="place_time",
-                label="放入时刻 (HH:MM，先输入再计算)",
+                label="放入时刻（仅时刻，如 10:30 或 10.30）",
                 kind="str",
                 default="10:30",
-                help="关闭「当前时间」时有效。",
+                help="关闭「当前时间」时有效；支持冒号或英文句点分隔。留空或无法识别时按 0:00。",
             ),
             StepParam(key="t_heat_ramp_min", label="升温时间 (分钟)", kind="float", default=10.0),
             StepParam(key="t_hold1_min", label="保温① (分钟)，默认 1h=60", kind="float", default=60.0),
@@ -123,9 +118,8 @@ class Ni4MoProcessScheduleStep:
 
     def run(self, *, files: list[tuple[str, bytes]], params: Mapping[str, Any]) -> StepOutputs:
         use_now = bool(params.get("use_now", True))
-        d_raw = str(params.get("place_date", "") or "").strip()
-        d = _parse_date(d_raw) or date.today()
-        t0 = _combine_place_datetime(d, str(params.get("place_time", "") or ""), use_now=use_now)
+        place_time_raw = str(params.get("place_time", "") or "")
+        t0 = _baseline_datetime(place_time=place_time_raw, use_now=use_now)
 
         def _f(key: str) -> float:
             v = params.get(key, 0)
@@ -204,7 +198,13 @@ class Ni4MoProcessScheduleStep:
         out.tables["生长阶段区间"] = df_grow_windows
         out.tables["全流程累加明细"] = df_phases
         out.tables["复制给手机AI（闹钟口令）"] = pd.DataFrame([{"全文": alarm_prompt}])
-        out.notes.append(f"放入基准：{_fmt(t0)}（自该时刻起累加各阶段分钟数）。")
+        out.notes.append(
+            f"放入基准：{_fmt(t0)}（自该时刻起累加各阶段分钟数；"
+            + ("运行时刻" if use_now else f"今天 {date.today().isoformat()} + 填入时刻")
+            + "）。"
+        )
+        if (not use_now) and place_time_raw.strip() and (_parse_hhmm(place_time_raw) is None):
+            out.notes.append("提示：未能识别「放入时刻」格式，已按当天 00:00 作为基准。")
         out.notes.append("【复制】下面整段可发给手机里的 AI，用于添加闹钟：\n\n" + alarm_prompt)
         out.downloads["手机闹钟口令 txt"] = ("ni4mo_手机闹钟口令.txt", prompt_bytes, "text/plain; charset=utf-8")
         return out
