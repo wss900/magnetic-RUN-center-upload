@@ -1,9 +1,13 @@
 __pycache__/
 *.py[cod]
+*$py.class
 
 .venv/
 venv/
 env/
+
+.env
+.env.*
 .env/
 
 .pytest_cache/
@@ -13,3 +17,13 @@ env/
 *.log
 .DS_Store
 Thumbs.db
+
+# 实验数据与导出结果（勿提交）
+data/
+samples/
+output/
+*.xlsx
+*.xls
+*.zip
+*.txt
+!magnetic-run-center-web/requirements.txt
